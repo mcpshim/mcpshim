@@ -229,3 +229,9 @@ Install executable wrappers instead:
 mcpshim script --install --dir ~/.local/bin
 notion search --query "projects" --limit 10
 ```
+
+---
+
+## See Also
+
+**[Pantalk](https://github.com/pantalk/pantalk)** — Give your AI agent a voice on every chat platform. mcpshim gives your agent tools; Pantalk gives it a voice across Slack, Discord, Telegram, and more. Together they form a complete agent infrastructure stack.
