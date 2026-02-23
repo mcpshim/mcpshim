@@ -1,0 +1,17 @@
+server:
+  # socket_path: defaults to $XDG_RUNTIME_DIR/mcpshim.sock (or /tmp/mcpshim-<uid>.sock)
+  # db_path: defaults to ~/.local/share/mcpshim/mcpshim.db
+
+# config is the source of truth for registered MCP servers
+servers:
+  - name: notion
+    alias: notion
+    transport: http
+    url: https://mcp.notion.com/mcp
+
+  - name: example
+    alias: example
+    transport: sse
+    url: https://mcp.example.com/sse
+    headers:
+      Authorization: Bearer ${TOKEN}
