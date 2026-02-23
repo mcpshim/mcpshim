@@ -50,10 +50,6 @@ graph TD
 | **Agent context budget** | Large MCP schemas in prompt   | Alias-based local command workflows |
 | **Operational history**  | Ad-hoc logging                | Built-in call history in SQLite     |
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=mcpshim/mcpshim&type=date&legend=top-left)](https://www.star-history.com/#mcpshim/mcpshim&type=date&legend=top-left)
-
 ---
 
 ## Architecture
