@@ -554,7 +554,7 @@ func printCallHelpFromDetail(d *protocol.ToolDetail) {
 				if len(descLines) > 0 {
 					first = descLines[0]
 				}
-				fmt.Printf("  --%-20s %s%s — %s\n", p.Name, typ, req, first)
+				fmt.Printf("  --%-20s %s%s - %s\n", p.Name, typ, req, first)
 				for _, line := range descLines[1:] {
 					fmt.Printf("  %-20s   %s\n", "", line)
 				}
@@ -880,7 +880,7 @@ func printResponse(resp *protocol.Response, jsonOut bool) int {
 						typ = "any"
 					}
 					if p.Description != "" {
-						fmt.Printf("  --%-20s %s%s — %s\n", p.Name, typ, req, p.Description)
+						fmt.Printf("  --%-20s %s%s - %s\n", p.Name, typ, req, p.Description)
 					} else {
 						fmt.Printf("  --%-20s %s%s\n", p.Name, typ, req)
 					}
