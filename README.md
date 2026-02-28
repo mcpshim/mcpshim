@@ -223,6 +223,8 @@ eval "$(mcpshim script)"
 notion search --query "projects" --limit 10
 ```
 
+If a server name/alias contains shell-incompatible characters (spaces, dashes, punctuation) MCPShim automatically normalizes it to a safe function name (for example, `my-server` becomes `my_server`).
+
 Install executable wrappers instead:
 
 ```bash
