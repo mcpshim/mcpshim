@@ -1,12 +1,12 @@
 <p align="center">
-	<img src="https://mcpshim.dev/icon.svg" alt="mcpshim" width="80" height="80" />
+	<img src="https://mcpshim.dev/icon.svg" alt="MCPShim" width="80" height="80" />
 </p>
 
-<h1 align="center">mcpshim</h1>
+<h1 align="center">MCPShim</h1>
 
 <p align="center">
-	<strong>Turn remote MCP servers into local command workflows.</strong><br/>
-	A lightweight daemon + CLI bridge that centralizes MCP sessions, auth, discovery, and tool execution behind one local Unix socket.
+	<strong>Use any MCP server as a standard CLI command.</strong><br/>
+	A lightweight daemon + CLI that turns remote MCP tools into native shell commands your agent or script can call directly.
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@ For LLM agents, there is also context pressure: dumping raw MCP schemas for ever
 
 `mcpshimd` handles MCP lifecycle concerns in one place: session management, discovery, retries, and OAuth flow.
 
-`mcpshim` provides a stable CLI surface over a local Unix socket so tools can be called consistently, with dynamic flags translated to MCP arguments at runtime.
+`mcpshim` exposes every remote MCP tool as a standard CLI command - flags map to tool parameters, output comes back as structured JSON. No SDKs, no libraries, just shell commands that work with any language or agent.
 
 ```mermaid
 graph TD
@@ -40,9 +40,9 @@ graph TD
 		Daemon --> MCPN["..."]
 ```
 
-## Why mcpshim
+## Why MCPShim
 
-|                          | Without mcpshim               | With mcpshim                        |
+|                          | Without MCPShim               | With MCPShim                        |
 | ------------------------ | ----------------------------- | ----------------------------------- |
 | **MCP integration**      | Custom per-server wiring      | One daemon + one CLI                |
 | **Auth handling**        | Per-script OAuth/header logic | Centralized in `mcpshimd`           |
@@ -234,4 +234,4 @@ notion search --query "projects" --limit 10
 
 ## See Also
 
-**[Pantalk](https://github.com/pantalk/pantalk)** — Give your AI agent a voice on every chat platform. mcpshim gives your agent tools; Pantalk gives it a voice across Slack, Discord, Telegram, and more. Together they form a complete agent infrastructure stack.
+**[Pantalk](https://github.com/pantalk/pantalk)** - Give your AI agent a voice on every chat platform. MCPShim gives your agent tools; Pantalk gives it a voice across Slack, Discord, Telegram, and more. Together they form a complete agent infrastructure stack.
