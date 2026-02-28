@@ -903,19 +903,79 @@ func printResponse(resp *protocol.Response, jsonOut bool) int {
 
 func printAliasScript(items []protocol.ServerInfo) {
 	fmt.Println("# source this in your shell")
-	for _, item := range items {
-		name := item.Alias
-		if name == "" {
-			name = item.Name
+	for _, target := range buildAliasTargets(items) {
+		if target.Sanitized != target.Source {
+			fmt.Printf("# %q renamed to %s for shell compatibility\n", target.Source, target.Sanitized)
 		}
-		if name == "" {
-			continue
-		}
-		fmt.Printf("%s() {\n", name)
-		fmt.Printf("  if [ $# -lt 1 ]; then mcpshim tools --server %s; return 1; fi\n", shellQuote(item.Name))
-		fmt.Printf("  mcpshim call --server %s --tool \"$1\" \"${@:2}\"\n", shellQuote(item.Name))
+		fmt.Printf("%s() {\n", target.Sanitized)
+		fmt.Printf("  if [ $# -lt 1 ]; then mcpshim tools --server %s; return 1; fi\n", shellQuote(target.ServerName))
+		fmt.Printf("  mcpshim call --server %s --tool \"$1\" \"${@:2}\"\n", shellQuote(target.ServerName))
 		fmt.Printf("}\n\n")
 	}
+}
+
+type aliasTarget struct {
+	ServerName string
+	Source     string
+	Sanitized  string
+}
+
+func buildAliasTargets(items []protocol.ServerInfo) []aliasTarget {
+	used := map[string]int{}
+	out := make([]aliasTarget, 0, len(items))
+	for _, item := range items {
+		source := item.Alias
+		if source == "" {
+			source = item.Name
+		}
+		if source == "" {
+			continue
+		}
+		base := sanitizeAliasName(source)
+		if base == "" {
+			continue
+		}
+		used[base]++
+		sanitized := base
+		if used[base] > 1 {
+			sanitized = fmt.Sprintf("%s_%d", base, used[base])
+		}
+		out = append(out, aliasTarget{
+			ServerName: item.Name,
+			Source:     source,
+			Sanitized:  sanitized,
+		})
+	}
+	return out
+}
+
+func sanitizeAliasName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range name {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_':
+			b.WriteRune(r)
+			lastUnderscore = false
+		default:
+			if !lastUnderscore {
+				b.WriteRune('_')
+				lastUnderscore = true
+			}
+		}
+	}
+	sanitized := strings.Trim(b.String(), "_")
+	if sanitized == "" {
+		return ""
+	}
+	if sanitized[0] >= '0' && sanitized[0] <= '9' {
+		sanitized = "s_" + sanitized
+	}
+	return sanitized
 }
 
 func installAliasScripts(dir string, items []protocol.ServerInfo) error {
@@ -925,24 +985,20 @@ func installAliasScripts(dir string, items []protocol.ServerInfo) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	for _, item := range items {
-		name := item.Alias
-		if name == "" {
-			name = item.Name
-		}
-		if name == "" {
+	for _, target := range buildAliasTargets(items) {
+		if target.Sanitized == "" {
 			continue
 		}
-		path := filepath.Join(dir, name)
+		path := filepath.Join(dir, target.Sanitized)
 		content := "#!/usr/bin/env bash\n" +
 			"set -euo pipefail\n" +
 			"if [ $# -lt 1 ]; then\n" +
-			"  mcpshim tools --server " + shellQuote(item.Name) + "\n" +
+			"  mcpshim tools --server " + shellQuote(target.ServerName) + "\n" +
 			"  exit 1\n" +
 			"fi\n" +
 			"tool=$1\n" +
 			"shift\n" +
-			"exec mcpshim call --server " + shellQuote(item.Name) + " --tool \"$tool\" \"$@\"\n"
+			"exec mcpshim call --server " + shellQuote(target.ServerName) + " --tool \"$tool\" \"$@\"\n"
 		if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 			return err
 		}
