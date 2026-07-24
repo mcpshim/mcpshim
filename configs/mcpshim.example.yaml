@@ -1,8 +1,13 @@
 server:
   # socket_path: defaults to $XDG_RUNTIME_DIR/mcpshim.sock (or /tmp/mcpshim-<uid>.sock)
   # db_path: defaults to ~/.local/share/mcpshim/mcpshim.db
+  # history_size: defaults to the newest 1000 calls
+  # allow_registry_writes: false (default) refuses `add`, `set auth`, and
+  #   `remove` from socket clients, because those actions rewrite this file.
+  #   Edit this file and run `mcpshim reload` instead, or set it to true to
+  #   let anything holding the socket change the registry.
 
-# config is the source of truth for registered MCP servers
+# config is the source of truth for MCP servers and native HTTP services
 servers:
   - name: notion
     alias: notion
@@ -15,3 +20,7 @@ servers:
     url: https://mcp.example.com/sse
     headers:
       Authorization: Bearer ${TOKEN}
+
+# Ordinary HTTP APIs can also be exposed as constrained raw or typed tools.
+# See configs/http-services.example.yaml and docs/http-services.md.
+http_services: []

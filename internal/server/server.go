@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 )
 
 type Server struct {
+	mu         sync.RWMutex
 	configPath string
 	cfg        *config.Config
 	registry   *mcp.Registry
@@ -31,6 +33,7 @@ type Server struct {
 }
 
 func New(configPath string, cfg *config.Config) *Server {
+	cfg = config.Clone(cfg)
 	return &Server{
 		configPath: configPath,
 		cfg:        cfg,
@@ -59,7 +62,7 @@ func (s *Server) Run() error {
 		}
 	}()
 
-	if err := os.MkdirAll(filepath.Dir(s.cfg.Server.SocketPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.cfg.Server.SocketPath), 0o700); err != nil {
 		return err
 	}
 	_ = os.Remove(s.cfg.Server.SocketPath)
@@ -75,7 +78,9 @@ func (s *Server) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	_ = s.registry.Refresh(context.Background())
+	refreshCtx, refreshCancel := context.WithTimeout(ctx, 20*time.Second)
+	_ = s.registry.Refresh(refreshCtx)
+	refreshCancel()
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
 	go func() {
@@ -84,7 +89,11 @@ func (s *Server) Run() error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = s.registry.Refresh(context.Background())
+				s.mu.RLock()
+				refreshCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				_ = s.registry.Refresh(refreshCtx)
+				cancel()
+				s.mu.RUnlock()
 			}
 		}
 	}()
@@ -129,11 +138,34 @@ func (s *Server) handleConn(conn net.Conn) {
 
 func (s *Server) handle(req protocol.Request) protocol.Response {
 	switch req.Action {
+	case "add_server", "remove_server", "set_auth", "reload":
+		s.mu.Lock()
+		defer s.mu.Unlock()
+	default:
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+	}
+
+	// Registry mutations persist to the config file, so socket access would
+	// otherwise imply config write access. Reload is not gated: it only
+	// re-reads whatever is already on disk.
+	switch req.Action {
+	case "add_server", "remove_server", "set_auth":
+		if !s.cfg.Server.AllowRegistryWrites {
+			return protocol.Response{
+				OK: false,
+				Error: "registry writes are disabled; edit the config file and run 'mcpshim reload', " +
+					"or set server.allow_registry_writes: true to permit socket clients to change the registry",
+			}
+		}
+	}
+
+	switch req.Action {
 	case "status":
 		return protocol.Response{OK: true, Status: &protocol.Status{
 			StartedAt:   s.startedAt,
 			UptimeSec:   int64(time.Since(s.startedAt).Seconds()),
-			ServerCount: len(s.cfg.Servers),
+			ServerCount: len(s.cfg.Servers) + len(s.cfg.HTTPServices),
 			ToolCount:   s.registry.ToolCount(),
 		}}
 	case "servers":
@@ -151,11 +183,21 @@ func (s *Server) handle(req protocol.Request) protocol.Response {
 		if limit <= 0 {
 			limit = 50
 		}
-		items, err := s.store.ListHistory(req.Server, req.Tool, limit)
+		items, err := s.store.ListHistory(s.canonicalServerName(req.Server), req.Tool, limit)
 		if err != nil {
 			return protocol.Response{OK: false, Error: err.Error()}
 		}
 		return protocol.Response{OK: true, History: items}
+	case "clear_history":
+		cleared, err := s.store.ClearHistory(s.canonicalServerName(req.Server), req.Tool, req.All)
+		if err != nil {
+			return protocol.Response{OK: false, Error: err.Error()}
+		}
+		return protocol.Response{
+			OK:      true,
+			Cleared: cleared,
+			Text:    fmt.Sprintf("cleared %d history entries", cleared),
+		}
 	case "inspect":
 		if req.Server == "" || req.Tool == "" {
 			return protocol.Response{OK: false, Error: "server and tool are required"}
@@ -177,7 +219,7 @@ func (s *Server) handle(req protocol.Request) protocol.Response {
 		result, err := s.registry.Call(ctx, req.Server, req.Tool, req.Args)
 		historyItem := protocol.HistoryItem{
 			At:         started,
-			Server:     req.Server,
+			Server:     s.canonicalServerName(req.Server),
 			Tool:       req.Tool,
 			Args:       req.Args,
 			Success:    err == nil,
@@ -186,9 +228,9 @@ func (s *Server) handle(req protocol.Request) protocol.Response {
 		if err != nil {
 			historyItem.Error = err.Error()
 		}
-		_ = s.store.InsertHistory(historyItem)
+		_ = s.store.InsertHistory(historyItem, s.cfg.Server.HistorySize)
 		if err != nil {
-			return protocol.Response{OK: false, Error: err.Error()}
+			return protocol.Response{OK: false, Error: err.Error(), Result: result}
 		}
 		return protocol.Response{OK: true, Result: result}
 	case "add_server":
@@ -202,38 +244,70 @@ func (s *Server) handle(req protocol.Request) protocol.Response {
 			Transport: req.Transport,
 			Headers:   req.Headers,
 		}
-		config.UpsertServer(s.cfg, item)
-		if err := config.Save(s.configPath, s.cfg); err != nil {
+		var previous *config.MCPServer
+		for _, server := range s.cfg.Servers {
+			if server.Name == req.Name {
+				copy := server
+				previous = &copy
+				break
+			}
+		}
+		candidate := config.Clone(s.cfg)
+		if err := config.UpsertServer(candidate, item); err != nil {
 			return protocol.Response{OK: false, Error: err.Error()}
 		}
-		s.registry.UpdateConfig(s.cfg)
-		_ = s.registry.Refresh(context.Background())
+		if err := config.Save(s.configPath, candidate); err != nil {
+			return protocol.Response{OK: false, Error: err.Error()}
+		}
+		if previous != nil && config.ResolveServer(*previous).URL != config.ResolveServer(item).URL && s.store != nil {
+			_ = s.store.DeleteTokens(previous.Name, mcp.TokenStoreKey(*previous))
+		}
+		s.cfg = candidate
+		s.registry.UpdateConfig(candidate)
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = s.registry.Refresh(refreshCtx)
+		cancel()
 		return protocol.Response{OK: true, Text: fmt.Sprintf("added server %s", req.Name)}
 	case "remove_server":
 		if req.Name == "" {
 			return protocol.Response{OK: false, Error: "name is required"}
 		}
-		if !config.RemoveServer(s.cfg, req.Name) {
+		candidate := config.Clone(s.cfg)
+		var removed config.MCPServer
+		for _, server := range candidate.Servers {
+			if server.Name == req.Name {
+				removed = server
+				break
+			}
+		}
+		if !config.RemoveServer(candidate, req.Name) {
 			return protocol.Response{OK: false, Error: "server not found"}
 		}
-		if err := config.Save(s.configPath, s.cfg); err != nil {
+		if err := config.Save(s.configPath, candidate); err != nil {
 			return protocol.Response{OK: false, Error: err.Error()}
 		}
-		s.registry.UpdateConfig(s.cfg)
-		_ = s.registry.Refresh(context.Background())
+		if s.store != nil {
+			_ = s.store.DeleteTokens(removed.Name, mcp.TokenStoreKey(removed))
+		}
+		s.cfg = candidate
+		s.registry.UpdateConfig(candidate)
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = s.registry.Refresh(refreshCtx)
+		cancel()
 		return protocol.Response{OK: true, Text: fmt.Sprintf("removed server %s", req.Name)}
 	case "set_auth":
 		if req.Name == "" {
 			return protocol.Response{OK: false, Error: "name is required"}
 		}
 		updated := false
-		for i := range s.cfg.Servers {
-			if s.cfg.Servers[i].Name == req.Name {
-				if s.cfg.Servers[i].Headers == nil {
-					s.cfg.Servers[i].Headers = map[string]string{}
+		candidate := config.Clone(s.cfg)
+		for i := range candidate.Servers {
+			if candidate.Servers[i].Name == req.Name {
+				if candidate.Servers[i].Headers == nil {
+					candidate.Servers[i].Headers = map[string]string{}
 				}
 				for k, v := range req.Headers {
-					s.cfg.Servers[i].Headers[k] = v
+					candidate.Servers[i].Headers[k] = v
 				}
 				updated = true
 				break
@@ -242,10 +316,11 @@ func (s *Server) handle(req protocol.Request) protocol.Response {
 		if !updated {
 			return protocol.Response{OK: false, Error: "server not found"}
 		}
-		if err := config.Save(s.configPath, s.cfg); err != nil {
+		if err := config.Save(s.configPath, candidate); err != nil {
 			return protocol.Response{OK: false, Error: err.Error()}
 		}
-		s.registry.UpdateConfig(s.cfg)
+		s.cfg = candidate
+		s.registry.UpdateConfig(candidate)
 		return protocol.Response{OK: true, Text: "updated authentication"}
 	case "reload":
 		cfg, err := config.Load(s.configPath)
@@ -257,27 +332,34 @@ func (s *Server) handle(req protocol.Request) protocol.Response {
 			if openErr != nil {
 				return protocol.Response{OK: false, Error: openErr.Error()}
 			}
-			if s.store != nil {
-				_ = s.store.Close()
-			}
+			previousStore := s.store
 			s.store = nextStore
 			s.registry = mcp.NewRegistry(cfg, nextStore)
+			if previousStore != nil {
+				_ = previousStore.Close()
+			}
 		}
 		s.cfg = cfg
 		s.registry.UpdateConfig(cfg)
-		_ = s.registry.Refresh(context.Background())
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_ = s.registry.Refresh(refreshCtx)
+		cancel()
 		return protocol.Response{OK: true, Text: "reloaded config"}
-	case "login":
-		if req.Server == "" {
-			return protocol.Response{OK: false, Error: "server is required"}
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
-		defer cancel()
-		if err := s.registry.Login(ctx, req.Server, false); err != nil {
-			return protocol.Response{OK: false, Error: err.Error()}
-		}
-		return protocol.Response{OK: true, Text: fmt.Sprintf("oauth login completed for %s", req.Server)}
 	default:
 		return protocol.Response{OK: false, Error: "unknown action"}
 	}
+}
+
+func (s *Server) canonicalServerName(name string) string {
+	for _, server := range s.cfg.Servers {
+		if server.Name == name || server.Alias == name {
+			return server.Name
+		}
+	}
+	for _, service := range s.cfg.HTTPServices {
+		if service.Name == name || service.Alias == name {
+			return service.Name
+		}
+	}
+	return name
 }

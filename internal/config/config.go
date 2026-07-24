@@ -13,13 +13,24 @@ import (
 )
 
 type Config struct {
-	Server  ServerConfig `yaml:"server"`
-	Servers []MCPServer  `yaml:"servers"`
+	Server       ServerConfig  `yaml:"server"`
+	Servers      []MCPServer   `yaml:"servers"`
+	HTTPServices []HTTPService `yaml:"http_services,omitempty"`
 }
 
+const DefaultHistorySize = 1000
+
 type ServerConfig struct {
-	SocketPath string `yaml:"socket_path"`
-	DBPath     string `yaml:"db_path"`
+	SocketPath  string `yaml:"socket_path"`
+	DBPath      string `yaml:"db_path"`
+	HistorySize int    `yaml:"history_size"`
+
+	// AllowRegistryWrites permits socket clients to edit the registry through
+	// add_server, set_auth, and remove_server. It is off by default because
+	// those actions persist to the config file, which makes socket access
+	// equivalent to config write access. Operators can always edit the file
+	// directly and reload.
+	AllowRegistryWrites bool `yaml:"allow_registry_writes,omitempty"`
 }
 
 type MCPServer struct {
@@ -93,14 +104,11 @@ func Load(path string) (*Config, error) {
 	if cfg.Server.DBPath == "" {
 		cfg.Server.DBPath = DefaultDBPath()
 	}
+	if cfg.Server.HistorySize == 0 {
+		cfg.Server.HistorySize = DefaultHistorySize
+	}
 	for i := range cfg.Servers {
 		s := &cfg.Servers[i]
-		s.URL = os.ExpandEnv(s.URL)
-		if s.Headers != nil {
-			for k, v := range s.Headers {
-				s.Headers[k] = os.ExpandEnv(v)
-			}
-		}
 		transport, transportErr := normalizeTransport(s.Transport)
 		if transportErr != nil {
 			return nil, transportErr
@@ -110,10 +118,45 @@ func Load(path string) (*Config, error) {
 			s.Alias = s.Name
 		}
 	}
+	normalizeHTTPServices(cfg.HTTPServices)
 	if err := validate(&cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// ResolveServer expands environment references in a disposable server copy.
+// Keeping the source config untouched prevents later CLI mutations from
+// writing resolved credentials back to disk.
+func ResolveServer(server MCPServer) MCPServer {
+	server.URL = os.ExpandEnv(server.URL)
+	if server.Headers != nil {
+		headers := make(map[string]string, len(server.Headers))
+		for key, value := range server.Headers {
+			headers[key] = os.ExpandEnv(value)
+		}
+		server.Headers = headers
+	}
+	return server
+}
+
+func Clone(cfg *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	clone := *cfg
+	clone.Servers = make([]MCPServer, len(cfg.Servers))
+	for i, server := range cfg.Servers {
+		clone.Servers[i] = server
+		if server.Headers != nil {
+			clone.Servers[i].Headers = make(map[string]string, len(server.Headers))
+			for key, value := range server.Headers {
+				clone.Servers[i].Headers[key] = value
+			}
+		}
+	}
+	clone.HTTPServices = cloneHTTPServices(cfg.HTTPServices)
+	return &clone
 }
 
 func Save(path string, cfg *Config) error {
@@ -155,8 +198,9 @@ func LoadOrInit(path string) (*Config, error) {
 	}
 	cfg = &Config{
 		Server: ServerConfig{
-			SocketPath: DefaultSocketPath(),
-			DBPath:     DefaultDBPath(),
+			SocketPath:  DefaultSocketPath(),
+			DBPath:      DefaultDBPath(),
+			HistorySize: DefaultHistorySize,
 		},
 		Servers: []MCPServer{},
 	}
@@ -167,50 +211,90 @@ func LoadOrInit(path string) (*Config, error) {
 }
 
 func validate(cfg *Config) error {
+	if cfg == nil {
+		return errors.New("nil config")
+	}
+	if cfg.Server.HistorySize < 0 {
+		return errors.New("server history_size cannot be negative")
+	}
 	seen := map[string]bool{}
 	aliases := map[string]bool{}
 	for _, s := range cfg.Servers {
 		if s.Name == "" {
 			return errors.New("server name is required")
 		}
-		if s.URL == "" {
+		resolvedURL, missingURLVar := expandEnvStrict(s.URL)
+		if missingURLVar != "" {
+			return fmt.Errorf("server %q url references unset environment variable %q", s.Name, missingURLVar)
+		}
+		if strings.TrimSpace(resolvedURL) == "" {
 			return fmt.Errorf("server %q url is required", s.Name)
+		}
+		for header, value := range s.Headers {
+			if _, missingHeaderVar := expandEnvStrict(value); missingHeaderVar != "" {
+				return fmt.Errorf("server %q header %q references unset environment variable %q", s.Name, header, missingHeaderVar)
+			}
 		}
 		if _, err := normalizeTransport(s.Transport); err != nil {
 			return fmt.Errorf("server %q: %w", s.Name, err)
 		}
-		if seen[s.Name] {
-			return fmt.Errorf("duplicate server name %q", s.Name)
+		if seen[s.Name] || aliases[s.Name] {
+			return fmt.Errorf("duplicate server identifier %q", s.Name)
 		}
-		seen[s.Name] = true
 		alias := s.Alias
 		if alias == "" {
 			alias = s.Name
 		}
-		if aliases[alias] {
-			return fmt.Errorf("duplicate alias %q", alias)
+		if alias != s.Name && (seen[alias] || aliases[alias]) {
+			return fmt.Errorf("duplicate server identifier %q", alias)
 		}
+		seen[s.Name] = true
 		aliases[alias] = true
 	}
-	return nil
+	return validateHTTPServices(cfg, seen, aliases)
 }
 
-func UpsertServer(cfg *Config, item MCPServer) {
+func expandEnvStrict(value string) (string, string) {
+	missing := ""
+	expanded := os.Expand(value, func(name string) string {
+		resolved, ok := os.LookupEnv(name)
+		if !ok && missing == "" {
+			missing = name
+		}
+		return resolved
+	})
+	return expanded, missing
+}
+
+func UpsertServer(cfg *Config, item MCPServer) error {
+	if cfg == nil {
+		return errors.New("nil config")
+	}
 	transport, err := normalizeTransport(item.Transport)
 	if err != nil {
-		transport = "http"
+		return err
 	}
 	item.Transport = transport
 	if item.Alias == "" {
 		item.Alias = item.Name
 	}
-	for i := range cfg.Servers {
-		if cfg.Servers[i].Name == item.Name {
-			cfg.Servers[i] = item
-			return
+	candidate := Clone(cfg)
+	for i := range candidate.Servers {
+		if candidate.Servers[i].Name == item.Name {
+			candidate.Servers[i] = item
+			if err := validate(candidate); err != nil {
+				return err
+			}
+			*cfg = *candidate
+			return nil
 		}
 	}
-	cfg.Servers = append(cfg.Servers, item)
+	candidate.Servers = append(candidate.Servers, item)
+	if err := validate(candidate); err != nil {
+		return err
+	}
+	*cfg = *candidate
+	return nil
 }
 
 func RemoveServer(cfg *Config, name string) bool {

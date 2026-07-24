@@ -2,19 +2,30 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mcpshim/mcpshim/internal/config"
 	"github.com/mcpshim/mcpshim/internal/store"
 )
+
+// TokenStoreKey binds a stored OAuth token to both the logical server and its
+// endpoint. Re-pointing a server name must never send an existing token to the
+// replacement URL.
+func TokenStoreKey(server config.MCPServer) string {
+	resolved := config.ResolveServer(server)
+	sum := sha256.Sum256([]byte(resolved.URL))
+	return fmt.Sprintf("%s:%x", server.Name, sum)
+}
 
 type sqliteTokenStore struct {
 	store      *store.Store
 	serverName string
 }
 
-func newSQLiteTokenStore(dbStore *store.Store, serverName string) transport.TokenStore {
+func newSQLiteTokenStore(dbStore *store.Store, serverName string) *sqliteTokenStore {
 	return &sqliteTokenStore{store: dbStore, serverName: serverName}
 }
 

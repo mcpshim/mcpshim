@@ -1,5 +1,5 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS  = -s -w
+LDFLAGS  = -s -w -X github.com/mcpshim/mcpshim/internal/version.Version=$(VERSION)
 
 CMDS = mcpshim mcpshimd
 

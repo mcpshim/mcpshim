@@ -4,12 +4,65 @@ on:
   push:
     tags:
       - 'v*'
+  # Dispatched by tag-release.yaml because tags pushed with GITHUB_TOKEN do not
+  # trigger another workflow.
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Validate tag and changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$GITHUB_REF_NAME" != "v${VERSION}" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match VERSION v${VERSION}" >&2
+            exit 1
+          fi
+
+          if ! grep -q "^## \\[$VERSION\\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no section for $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Vulnerability check
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Test
+        run: go test ./... -count=1 -race
+
+      - name: Test static release mode
+        env:
+          CGO_ENABLED: '0'
+        run: go test ./... -count=1
+
   release:
+    needs: validate
     runs-on: ubuntu-latest
 
     strategy:
@@ -28,10 +81,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -42,7 +95,7 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          LDFLAGS="-s -w"
+          LDFLAGS="-s -w -X github.com/mcpshim/mcpshim/internal/version.Version=${VERSION}"
           EXT=""
           if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
 
@@ -50,29 +103,124 @@ jobs:
           mkdir -p "${OUTDIR}"
 
           for cmd in mcpshim mcpshimd; do
-            echo "Building ${cmd}..."
             go build -trimpath -ldflags "${LDFLAGS}" -o "${OUTDIR}/${cmd}${EXT}" "./cmd/${cmd}"
           done
 
           cp configs/mcpshim.example.yaml "${OUTDIR}/mcpshim.example.yaml"
-          cp README.md "${OUTDIR}/README.md"
+          cp configs/http-services.example.yaml "${OUTDIR}/http-services.example.yaml"
+          mkdir -p "${OUTDIR}/docs"
+          cp docs/http-services.md "${OUTDIR}/docs/http-services.md"
+          cp README.md LICENSE "${OUTDIR}/"
 
           tar -czf "dist/mcpshim-${VERSION}-${GOOS}-${GOARCH}.tar.gz" -C dist "mcpshim-${VERSION}-${GOOS}-${GOARCH}"
+          cp "dist/mcpshim-${VERSION}-${GOOS}-${GOARCH}.tar.gz" "dist/mcpshim-${GOOS}-${GOARCH}.tar.gz"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: mcpshim-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*.tar.gz
 
-  publish:
+  image:
     needs: release
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=MCPShim
+            org.opencontainers.image.description=Use remote MCP servers and configured HTTP APIs as standard CLI commands
+
+      - name: Build and publish image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+  publish:
+    needs:
+      - release
+      - image
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          {
+            echo "content<<CHANGELOG_EOF"
+            echo "Container image: \`${IMAGE}:${GITHUB_REF_NAME}\`"
+            echo
+            echo "Digest: \`${DIGEST}\`"
+            echo
+            awk -v version="$VERSION" '
+              $0 ~ "^## \\[" version "\\]" {
+                found = 1
+                next
+              }
+              found && /^## \[/ {
+                exit
+              }
+              found {
+                print
+              }
+            ' CHANGELOG.md
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
+          pattern: mcpshim-${{ github.ref_name }}-*
           path: dist
           merge-multiple: true
 
@@ -81,9 +229,10 @@ jobs:
         run: sha256sum *.tar.gz > checksums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          generate_release_notes: true
+          body: ${{ steps.notes.outputs.content }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/*.tar.gz
             dist/checksums.txt

@@ -1,0 +1,3 @@
+server:
+  history_size: 1000
+servers: []
