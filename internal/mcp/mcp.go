@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/mark3labs/mcp-go/client/transport"
 	mcpproto "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mcpshim/mcpshim/internal/config"
+	"github.com/mcpshim/mcpshim/internal/httpbinding"
 	"github.com/mcpshim/mcpshim/internal/protocol"
 	"github.com/mcpshim/mcpshim/internal/store"
 )
@@ -22,6 +24,29 @@ type Registry struct {
 	store      *store.Store
 	toolCache  map[string][]protocol.ToolInfo
 	cacheStamp time.Time
+}
+
+type ToolCallError struct {
+	Result *mcpproto.CallToolResult
+	text   string
+}
+
+func (e *ToolCallError) Error() string {
+	return e.text
+}
+
+func newToolCallError(result *mcpproto.CallToolResult) *ToolCallError {
+	messages := make([]string, 0, len(result.Content))
+	for _, content := range result.Content {
+		if text := strings.TrimSpace(mcpproto.GetTextFromContent(content)); text != "" {
+			messages = append(messages, text)
+		}
+	}
+	message := strings.Join(messages, "\n")
+	if message == "" {
+		message = "MCP tool reported an error"
+	}
+	return &ToolCallError{Result: result, text: message}
 }
 
 func NewRegistry(cfg *config.Config, dbStore *store.Store) *Registry {
@@ -44,11 +69,23 @@ func (r *Registry) Servers() []protocol.ServerInfo {
 		out = append(out, protocol.ServerInfo{
 			Name:      s.Name,
 			Alias:     s.Alias,
+			Kind:      "mcp",
 			URL:       s.URL,
 			Transport: s.Transport,
 			HasAuth:   hasAuthorizationHeader(s.Headers),
 		})
 	}
+	for _, service := range r.cfg.HTTPServices {
+		out = append(out, protocol.ServerInfo{
+			Name:      service.Name,
+			Alias:     service.Alias,
+			Kind:      "http",
+			URL:       service.BaseURL,
+			Transport: "http",
+			HasAuth:   hasAuthorizationHeader(service.Headers),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -59,19 +96,26 @@ func (r *Registry) ListTools(ctx context.Context, server string) ([]protocol.Too
 
 	if server != "" {
 		s, ok := findServer(cfg, server)
-		if !ok {
-			return nil, fmt.Errorf("unknown server %q", server)
+		if ok {
+			return fetchToolsForServer(ctx, s, r.store, false)
 		}
-		return fetchToolsForServer(ctx, s, r.store, true)
+		service, ok := findHTTPService(cfg, server)
+		if ok {
+			return httpbinding.ListTools(service), nil
+		}
+		return nil, fmt.Errorf("unknown server %q", server)
 	}
 
 	all := []protocol.ToolInfo{}
 	for _, s := range cfg.Servers {
-		items, err := fetchToolsForServer(ctx, s, r.store, true)
+		items, err := fetchToolsForServer(ctx, s, r.store, false)
 		if err != nil {
 			continue
 		}
 		all = append(all, items...)
+	}
+	for _, service := range cfg.HTTPServices {
+		all = append(all, httpbinding.ListTools(service)...)
 	}
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].Server == all[j].Server {
@@ -94,6 +138,9 @@ func (r *Registry) Refresh(ctx context.Context) error {
 			continue
 		}
 		cache[s.Name] = tools
+	}
+	for _, service := range cfg.HTTPServices {
+		cache[service.Name] = httpbinding.ListTools(service)
 	}
 
 	r.mu.Lock()
@@ -120,10 +167,14 @@ func (r *Registry) InspectTool(ctx context.Context, server, tool string) (*proto
 
 	s, ok := findServer(cfg, server)
 	if !ok {
+		service, serviceOK := findHTTPService(cfg, server)
+		if serviceOK {
+			return httpbinding.InspectTool(service, tool)
+		}
 		return nil, fmt.Errorf("unknown server %q", server)
 	}
 
-	tools, err := fetchToolsRaw(ctx, s, r.store, true)
+	tools, err := fetchToolsRaw(ctx, s, r.store, false)
 	if err != nil {
 		return nil, err
 	}
@@ -148,13 +199,17 @@ func (r *Registry) Call(ctx context.Context, server string, tool string, args ma
 
 	s, ok := findServer(cfg, server)
 	if !ok {
+		service, serviceOK := findHTTPService(cfg, server)
+		if serviceOK {
+			return httpbinding.Call(ctx, service, tool, args)
+		}
 		return nil, fmt.Errorf("unknown server %q", server)
 	}
 	if args == nil {
 		args = map[string]interface{}{}
 	}
 
-	res, err := runWithOAuthFallback(ctx, s, r.store, true, func(cli compatibleClient) (interface{}, error) {
+	res, err := runWithOAuthFallback(ctx, s, r.store, false, func(cli compatibleClient) (interface{}, error) {
 		req := mcpproto.CallToolRequest{}
 		req.Params.Name = tool
 		req.Params.Arguments = args
@@ -163,10 +218,13 @@ func (r *Registry) Call(ctx context.Context, server string, tool string, args ma
 		if err != nil {
 			return nil, err
 		}
+		if result.IsError {
+			return result, newToolCallError(result)
+		}
 		return result, nil
 	})
 	if err != nil {
-		return nil, err
+		return res, err
 	}
 	return res, nil
 }
@@ -178,6 +236,9 @@ func (r *Registry) Login(ctx context.Context, server string, manual bool) error 
 
 	s, ok := findServer(cfg, server)
 	if !ok {
+		if _, serviceOK := findHTTPService(cfg, server); serviceOK {
+			return fmt.Errorf("http service %q does not use MCP OAuth login", server)
+		}
 		return fmt.Errorf("unknown server %q", server)
 	}
 
@@ -296,6 +357,7 @@ type compatibleClient interface {
 }
 
 func newClient(s config.MCPServer) (compatibleClient, func(), error) {
+	s = config.ResolveServer(s)
 	var cli compatibleClient
 	if s.Transport == "sse" {
 		headers := map[string]string{}
@@ -336,4 +398,13 @@ func findServer(cfg *config.Config, nameOrAlias string) (config.MCPServer, bool)
 		}
 	}
 	return config.MCPServer{}, false
+}
+
+func findHTTPService(cfg *config.Config, nameOrAlias string) (config.HTTPService, bool) {
+	for _, service := range cfg.HTTPServices {
+		if service.Name == nameOrAlias || service.Alias == nameOrAlias {
+			return service, true
+		}
+	}
+	return config.HTTPService{}, false
 }

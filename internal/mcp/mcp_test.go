@@ -1,8 +1,12 @@
 package mcp
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	mcpproto "github.com/mark3labs/mcp-go/mcp"
+	"github.com/mcpshim/mcpshim/internal/config"
 	"github.com/mcpshim/mcpshim/internal/protocol"
 )
 
@@ -27,6 +31,24 @@ func TestParseSchema(t *testing.T) {
 	// properties should be sorted
 	if props[0] != "filter" || props[1] != "limit" || props[2] != "query" {
 		t.Errorf("expected sorted properties [filter limit query], got %v", props)
+	}
+}
+
+func TestToolCallErrorPreservesResult(t *testing.T) {
+	result := &mcpproto.CallToolResult{
+		Content: []mcpproto.Content{mcpproto.NewTextContent("permission denied")},
+		IsError: true,
+	}
+
+	err := newToolCallError(result)
+	if err == nil {
+		t.Fatal("newToolCallError() = nil")
+	}
+	if err.Error() != "permission denied" {
+		t.Fatalf("error = %q, want permission denied", err)
+	}
+	if err.Result != result {
+		t.Fatal("tool call result was not preserved")
 	}
 }
 
@@ -117,5 +139,93 @@ func TestToolDetailProtocol(t *testing.T) {
 	}
 	if !d.Properties[0].Required {
 		t.Error("expected first property to be required")
+	}
+}
+
+func TestRegistryMetadataAndConfigUpdates(t *testing.T) {
+	cfg := &config.Config{Servers: []config.MCPServer{
+		{Name: "one", Alias: "first", URL: "https://one.example.com/mcp", Transport: "http"},
+		{Name: "two", Alias: "second", URL: "https://two.example.com/sse", Transport: "sse", Headers: map[string]string{"Authorization": "Bearer token"}},
+	}}
+	registry := NewRegistry(cfg, nil)
+	registry.toolCache["one"] = []protocol.ToolInfo{{Name: "search"}, {Name: "create"}}
+
+	servers := registry.Servers()
+	if len(servers) != 2 || servers[0].Alias != "first" || !servers[1].HasAuth {
+		t.Fatalf("servers = %#v", servers)
+	}
+	if registry.ToolCount() != 2 {
+		t.Fatalf("tool count = %d, want 2", registry.ToolCount())
+	}
+
+	next := &config.Config{Servers: []config.MCPServer{{Name: "three", Alias: "third", URL: "https://three.example.com/mcp"}}}
+	registry.UpdateConfig(next)
+	if registry.ToolCount() != 0 {
+		t.Fatalf("tool cache was not cleared: %d", registry.ToolCount())
+	}
+	if _, ok := findServer(next, "third"); !ok {
+		t.Fatal("findServer() did not match alias")
+	}
+	if _, ok := findServer(next, "missing"); ok {
+		t.Fatal("findServer() matched missing server")
+	}
+}
+
+func TestRegistryExposesHTTPServicesAsTools(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"item-1"}`))
+	}))
+	defer upstream.Close()
+
+	cfg := &config.Config{
+		HTTPServices: []config.HTTPService{{
+			Name:    "inventory",
+			Alias:   "items",
+			BaseURL: upstream.URL,
+			RawTool: &config.HTTPRawTool{
+				Name:    "request",
+				Methods: []string{"GET"},
+				Paths:   []string{"/v1/**"},
+			},
+			Tools: []config.HTTPTool{{
+				Name:        "get_item",
+				Description: "Get an item",
+				Request: config.HTTPRequest{
+					Method: "GET",
+					Path:   "/v1/items/{item_id}",
+				},
+				Inputs: map[string]config.HTTPInput{
+					"item_id": {Type: "string", Required: true},
+				},
+			}},
+		}},
+	}
+	registry := NewRegistry(cfg, nil)
+
+	servers := registry.Servers()
+	if len(servers) != 1 || servers[0].Kind != "http" || servers[0].Alias != "items" {
+		t.Fatalf("servers = %#v", servers)
+	}
+	tools, err := registry.ListTools(t.Context(), "items")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 2 || tools[0].Name != "get_item" || tools[1].Name != "request" {
+		t.Fatalf("tools = %#v", tools)
+	}
+	detail, err := registry.InspectTool(t.Context(), "inventory", "get_item")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Properties) != 1 || !detail.Properties[0].Required {
+		t.Fatalf("detail = %#v", detail)
+	}
+	result, err := registry.Call(t.Context(), "items", "get_item", map[string]interface{}{"item_id": "item-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("http result is nil")
 	}
 }

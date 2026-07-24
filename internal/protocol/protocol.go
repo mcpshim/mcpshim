@@ -13,11 +13,13 @@ type Request struct {
 	Transport string                 `json:"transport,omitempty"`
 	Headers   map[string]string      `json:"headers,omitempty"`
 	Args      map[string]interface{} `json:"args,omitempty"`
+	All       bool                   `json:"all,omitempty"`
 }
 
 type ServerInfo struct {
 	Name      string `json:"name"`
 	Alias     string `json:"alias,omitempty"`
+	Kind      string `json:"kind"`
 	URL       string `json:"url"`
 	Transport string `json:"transport"`
 	HasAuth   bool   `json:"has_auth"`
@@ -74,4 +76,5 @@ type Response struct {
 	ToolDetail *ToolDetail   `json:"tool_detail,omitempty"`
 	Result     interface{}   `json:"result,omitempty"`
 	Text       string        `json:"text,omitempty"`
+	Cleared    int64         `json:"cleared,omitempty"`
 }

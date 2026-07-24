@@ -20,6 +20,7 @@ import (
 	mcpproto "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mcpshim/mcpshim/internal/config"
 	"github.com/mcpshim/mcpshim/internal/store"
+	"github.com/mcpshim/mcpshim/internal/version"
 )
 
 const oauthCallbackTimeout = 5 * time.Minute
@@ -44,7 +45,7 @@ func runWithOAuthFallback[T any](ctx context.Context, s config.MCPServer, dbStor
 
 	oauthClient, closeFn, err := newOAuthClient(s, mcpclient.OAuthConfig{
 		RedirectURI: redirectURI,
-		TokenStore:  newSQLiteTokenStore(dbStore, s.Name),
+		TokenStore:  newSQLiteTokenStore(dbStore, TokenStoreKey(s)),
 		PKCEEnabled: true,
 	})
 	if err != nil {
@@ -63,7 +64,7 @@ func runWithOAuthFallback[T any](ctx context.Context, s config.MCPServer, dbStor
 	}
 	if !interactive {
 		var zero T
-		return zero, fmt.Errorf("server %q requires oauth authorization; run a direct command like mcpshim tools --server %s to complete login", s.Name, s.Name)
+		return zero, fmt.Errorf("server %q requires oauth authorization; run mcpshim login --server %s to complete login", s.Name, s.Name)
 	}
 	if callback == nil {
 		var zero T
@@ -93,7 +94,7 @@ func runOAuthLogin(ctx context.Context, s config.MCPServer, dbStore *store.Store
 
 	oauthClient, closeFn, err := newOAuthClient(s, mcpclient.OAuthConfig{
 		RedirectURI: redirectURI,
-		TokenStore:  newSQLiteTokenStore(dbStore, s.Name),
+		TokenStore:  newSQLiteTokenStore(dbStore, TokenStoreKey(s)),
 		PKCEEnabled: true,
 	})
 	if err != nil {
@@ -132,7 +133,7 @@ func runOperationWithClient[T any](ctx context.Context, client compatibleClient,
 	}
 	initReq := mcpproto.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcpproto.LATEST_PROTOCOL_VERSION
-	initReq.Params.ClientInfo = mcpproto.Implementation{Name: "mcpshimd", Version: "dev"}
+	initReq.Params.ClientInfo = mcpproto.Implementation{Name: "mcpshimd", Version: version.Version}
 	if _, err := client.Initialize(ctx, initReq); err != nil {
 		var zero T
 		return zero, err
@@ -325,6 +326,7 @@ func (s *oauthCallbackServer) wait(ctx context.Context) (map[string]string, erro
 }
 
 func newOAuthClient(s config.MCPServer, oauthConfig mcpclient.OAuthConfig) (compatibleClient, func(), error) {
+	s = config.ResolveServer(s)
 	if s.Transport == "sse" {
 		opts := []transport.ClientOption{}
 		if len(s.Headers) > 0 {

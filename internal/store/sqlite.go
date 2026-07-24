@@ -6,16 +6,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mcpshim/mcpshim/internal/protocol"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 type Store struct {
 	db *sql.DB
+	mu sync.RWMutex
 }
 
 func Open(path string) (*Store, error) {
@@ -24,12 +26,23 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("create db directory: %w", err)
 		}
 	}
+	if path != ":memory:" {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("create sqlite db: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			return nil, fmt.Errorf("close sqlite db: %w", err)
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return nil, fmt.Errorf("secure sqlite db: %w", err)
+		}
+	}
 
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite db: %w", err)
 	}
-
 	s := &Store{db: db}
 	if err := s.initSchema(); err != nil {
 		_ = db.Close()
@@ -42,6 +55,8 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.db.Close()
 }
 
@@ -74,7 +89,10 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 	return nil
 }
 
-func (s *Store) InsertHistory(item protocol.HistoryItem) error {
+func (s *Store) InsertHistory(item protocol.HistoryItem, historySize int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var argsJSON string
 	if len(item.Args) > 0 {
 		data, err := json.Marshal(item.Args)
@@ -84,7 +102,13 @@ func (s *Store) InsertHistory(item protocol.HistoryItem) error {
 		argsJSON = string(data)
 	}
 
-	_, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin history insert: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
 INSERT INTO call_history (at_utc, server, tool, args_json, success, error, duration_ms)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 `,
@@ -99,10 +123,26 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 	if err != nil {
 		return fmt.Errorf("insert history: %w", err)
 	}
+	if historySize > 0 {
+		if _, err := tx.Exec(`
+DELETE FROM call_history
+WHERE id NOT IN (
+	SELECT id FROM call_history ORDER BY id DESC LIMIT ?
+)
+`, historySize); err != nil {
+			return fmt.Errorf("prune history: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit history insert: %w", err)
+	}
 	return nil
 }
 
 func (s *Store) ListHistory(serverFilter string, toolFilter string, limit int) ([]protocol.HistoryItem, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if limit <= 0 {
 		limit = 50
 	}
@@ -181,7 +221,50 @@ func (s *Store) ListHistory(serverFilter string, toolFilter string, limit int) (
 	return out, nil
 }
 
+func (s *Store) ClearHistory(serverFilter string, toolFilter string, all bool) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if all && (serverFilter != "" || toolFilter != "") {
+		return 0, fmt.Errorf("--all cannot be combined with history filters")
+	}
+	if !all && serverFilter == "" && toolFilter == "" {
+		return 0, fmt.Errorf("history filter or explicit --all is required")
+	}
+
+	query := `DELETE FROM call_history`
+	args := make([]any, 0, 2)
+	where := ""
+	if serverFilter != "" {
+		where += " server = ?"
+		args = append(args, serverFilter)
+	}
+	if toolFilter != "" {
+		if where != "" {
+			where += " AND"
+		}
+		where += " tool = ?"
+		args = append(args, toolFilter)
+	}
+	if where != "" {
+		query += " WHERE" + where
+	}
+
+	result, err := s.db.Exec(query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("clear history: %w", err)
+	}
+	cleared, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count cleared history: %w", err)
+	}
+	return cleared, nil
+}
+
 func (s *Store) GetToken(server string) (*mcpclient.Token, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	var tokenJSON string
 	err := s.db.QueryRow(`SELECT token_json FROM oauth_tokens WHERE server = ?`, server).Scan(&tokenJSON)
 	if err != nil {
@@ -201,6 +284,9 @@ func (s *Store) GetToken(server string) (*mcpclient.Token, error) {
 }
 
 func (s *Store) SaveToken(server string, token *mcpclient.Token) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if token == nil {
 		return fmt.Errorf("token is required")
 	}
@@ -215,6 +301,21 @@ ON CONFLICT(server) DO UPDATE SET token_json=excluded.token_json, updated_at_utc
 `, server, string(data), time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("save token: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) DeleteTokens(keys ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, err := s.db.Exec(`DELETE FROM oauth_tokens WHERE server = ?`, key); err != nil {
+			return fmt.Errorf("delete token: %w", err)
+		}
 	}
 	return nil
 }

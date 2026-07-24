@@ -4,22 +4,21 @@ on:
   push:
     branches:
       - main
+      - next
     tags-ignore:
       - 'v*'
     paths-ignore:
       - 'docs/**'
       - '*.md'
       - 'LICENSE'
-      - 'configs/**'
-      - '.github/**'
   pull_request:
     branches:
       - main
+      - next
     paths-ignore:
       - 'docs/**'
       - '*.md'
       - 'LICENSE'
-      - 'configs/**'
 
 permissions:
   contents: read
@@ -31,12 +30,21 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: Verify formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            echo "$unformatted"
+            exit 1
+          fi
 
       - name: Vet
         run: go vet ./...
@@ -49,6 +57,11 @@ jobs:
       - name: Test
         run: go test ./... -count=1 -race
 
+      - name: Test static release mode
+        env:
+          CGO_ENABLED: '0'
+        run: go test ./... -count=1
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath ./cmd/mcpshim
@@ -58,7 +71,7 @@ jobs:
     name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
     needs: check
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next'
 
     strategy:
       fail-fast: false
@@ -77,10 +90,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -95,3 +108,61 @@ jobs:
           for cmd in mcpshim mcpshimd; do
             go build -trimpath -o "${cmd}${EXT}" "./cmd/${cmd}"
           done
+
+  container:
+    name: Build and smoke-test container
+    runs-on: ubuntu-latest
+    needs: check
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          push: false
+          tags: mcpshim/mcpshim:ci
+          build-args: |
+            VERSION=v${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          container="mcpshim-ci"
+          cleanup() {
+            docker rm --force "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run --detach --name "$container" mcpshim/mcpshim:ci
+
+          for attempt in $(seq 1 30); do
+            if docker exec "$container" mcpshim --json status | grep -q '"server_count": 0'; then
+              docker exec "$container" mcpshim version
+              echo "MCPShim container is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "MCPShim container did not become ready within 60 seconds" >&2
+          docker logs --tail 100 "$container" >&2 || true
+          exit 1

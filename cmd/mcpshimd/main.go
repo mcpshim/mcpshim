@@ -7,6 +7,7 @@ import (
 
 	"github.com/mcpshim/mcpshim/internal/config"
 	"github.com/mcpshim/mcpshim/internal/server"
+	"github.com/mcpshim/mcpshim/internal/version"
 )
 
 func main() {
@@ -17,7 +18,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("mcpshimd dev")
+		fmt.Printf("mcpshimd %s\n", version.Version)
 		os.Exit(0)
 	}
 

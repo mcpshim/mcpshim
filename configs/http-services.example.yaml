@@ -1,0 +1,212 @@
+server:
+  # socket_path: defaults to $XDG_RUNTIME_DIR/mcpshim.sock
+  # db_path: defaults to ~/.local/share/mcpshim/mcpshim.db
+  history_size: 1000
+
+# MCP servers and configured HTTP services share the same discovery, call,
+# history, alias, and shell-wrapper interfaces.
+servers: []
+
+http_services:
+  - name: deployment-api
+    alias: deploy
+    description: Manage application deployments
+    base_url: https://deployments.example.com/api
+
+    # These headers are attached by the daemon. Protected authentication and
+    # transport headers cannot be overridden by a caller; a non-protected
+    # header can be changed only when explicitly exposed below. Environment
+    # references remain references when the configuration is saved.
+    headers:
+      Authorization: Bearer ${DEPLOY_API_TOKEN}
+      Accept: application/json
+
+    policy:
+      timeout_seconds: 20
+      max_request_bytes: 1048576
+      max_response_bytes: 2097152
+      redirects: same-origin
+      allowed_request_content_types:
+        - application/json
+        - text/plain
+      allowed_response_content_types:
+        - application/json
+        - text/plain
+      success_statuses: [200, 201, 202, 204, 304]
+      response_headers:
+        - ETag
+        - Location
+        - Retry-After
+        - X-Request-ID
+
+    # Optional curl-like access. The caller still cannot change the host,
+    # configured auth, allowed methods, allowed paths, or policy limits.
+    raw_tool:
+      name: request
+      description: Make a constrained request to the deployment API
+      methods: [GET, HEAD, POST, PATCH, DELETE, OPTIONS]
+      paths:
+        - /v1/deployments/**
+        - /v1/teams/*/deployments/**
+      request_headers:
+        - Accept
+        - Idempotency-Key
+        - If-Match
+        - If-None-Match
+        - X-Trace-ID
+
+    tools:
+      - name: get_deployment
+        description: Get one deployment and optionally include related data
+        request:
+          method: GET
+          path: /v1/deployments/{deployment_id}
+          query:
+            include:
+              $arg: include
+              $default: [status, target]
+          headers:
+            If-None-Match:
+              $arg: etag
+              $omit_if_missing: true
+        inputs:
+          deployment_id:
+            type: string
+            description: Deployment identifier
+            required: true
+          include:
+            type: array
+            description: Related records to include
+            items:
+              type: string
+          etag:
+            type: string
+            description: Return 304 when this entity tag still matches
+
+      - name: create_deployment
+        description: Create a deployment from a nested release specification
+        request:
+          method: POST
+          path: /v1/teams/{team_id}/deployments
+          query:
+            dry_run:
+              $arg: dry_run
+              $default: false
+          headers:
+            Idempotency-Key:
+              $arg: idempotency_key
+          body:
+            content_type: application/json
+            template:
+              release:
+                name:
+                  $format: "{service}:{version}"
+                artifact:
+                  image:
+                    repository:
+                      $arg: image_repository
+                    tag:
+                      $arg: version
+                target:
+                  environment:
+                    $arg: environment
+                  region:
+                    $arg: region
+                    $default: us-east-1
+                rollout:
+                  strategy:
+                    $arg: rollout_strategy
+                    $default: rolling
+                  steps:
+                    $arg: rollout_steps
+                    $default:
+                      - percentage: 10
+                        wait_seconds: 60
+                      - percentage: 100
+                metadata:
+                  labels:
+                    $arg: labels
+                    $default: {}
+                  annotations:
+                    owner:
+                      $arg: owner
+                    ticket:
+                      $arg: ticket
+                      $omit_if_missing: true
+                checks:
+                  - kind: http
+                    config:
+                      path: /health
+                      expected_status: 200
+                  - $arg: custom_check
+                    $omit_if_missing: true
+        inputs:
+          team_id:
+            type: string
+            description: Team that owns the deployment
+            required: true
+          service:
+            type: string
+            required: true
+          version:
+            type: string
+            required: true
+          image_repository:
+            type: string
+            required: true
+          environment:
+            type: string
+            required: true
+            enum: [staging, production]
+          region:
+            type: string
+          rollout_strategy:
+            type: string
+            enum: [rolling, canary, immediate]
+          rollout_steps:
+            type: array
+            items:
+              type: object
+          labels:
+            type: object
+          owner:
+            type: string
+            required: true
+          ticket:
+            type: string
+          custom_check:
+            type: object
+          dry_run:
+            type: boolean
+          idempotency_key:
+            type: string
+            required: true
+
+      - name: cancel_deployment
+        description: Cancel an active deployment
+        request:
+          method: POST
+          path: /v1/deployments/{deployment_id}/cancel
+          body:
+            content_type: application/json
+            template:
+              reason:
+                $arg: reason
+              audit:
+                requested_by:
+                  $arg: requested_by
+                ticket:
+                  $arg: ticket
+                  $omit_if_missing: true
+        inputs:
+          deployment_id:
+            type: string
+            required: true
+          reason:
+            type: string
+            required: true
+          requested_by:
+            type: string
+            required: true
+          ticket:
+            type: string
