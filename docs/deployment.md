@@ -437,8 +437,8 @@ is two hops from your Notion workspace. That composition is the point of the
 stack - and the reason to be deliberate about which servers are in the registry
 of the daemon that a chat-reachable agent can talk to.
 
-If you run [Pantalk Station](https://github.com/pantalk/station), the same logic
-holds: Station is explicitly a single-tenant trusted-host environment, so an
+If you run [Pantalk Ghost](https://github.com/pantalk/ghost), the same logic
+holds: Ghost is explicitly a single-tenant trusted-host environment, so an
 `mcpshimd` reachable from inside it inherits that posture. Keep its registry
 narrow.
 

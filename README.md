@@ -80,7 +80,13 @@ go install github.com/mcpshim/mcpshim/cmd/mcpshim@latest
 
 ```bash
 mkdir -p ~/.config/mcpshim
-cp configs/mcpshim.example.yaml ~/.config/mcpshim/config.yaml
+cat > ~/.config/mcpshim/config.yaml <<'YAML'
+servers:
+  - name: notion
+    alias: notion
+    transport: http
+    url: https://mcp.notion.com/mcp
+YAML
 ```
 
 ### 3. Start daemon and inspect
@@ -331,6 +337,10 @@ model of the socket, OAuth in containers, and the operational caveats.
 
 ---
 
-## See Also
+## Ecosystem
 
-**[Pantalk](https://github.com/pantalk/pantalk)** - Give your AI agent a voice on every chat platform. MCPShim gives your agent tools; Pantalk gives it a voice across Slack, Discord, Telegram, and more. Together they form a complete agent infrastructure stack.
+| Project                                       | Role                                                           |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| [zot](https://github.com/openzot/openzot)     | Run complete coding tasks autonomously from a single brief     |
+| [Pantalk](https://github.com/pantalk/pantalk) | Connect coding agents to the chat platforms people already use |
+| [crmkit](https://github.com/crmkit/crmkit)    | Give agents a shared CRM and system of record over HTTP or MCP |
